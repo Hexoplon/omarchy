@@ -49,7 +49,7 @@ fixture="$SHELL_TEST_DIR/fixtures/network-captive-portal"
 mkdir -p "$stage/network" "$stage/bin" "$stage/home"
 ln -s "$ROOT/shell/Ui" "$stage/Ui"
 ln -s "$ROOT/shell/Commons" "$stage/Commons"
-cp -r "$fixture/mocks" "$stage/mocks"
+cp -r "$SHELL_TEST_DIR/fixtures/network-panel/mocks" "$stage/mocks"
 cp "$fixture/shell.qml" "$stage/shell.qml"
 cp "$ROOT/shell/plugins/panels/network/Model.js" "$stage/network/Model.js"
 node - "$ROOT" "$stage" <<'JS'
