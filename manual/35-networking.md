@@ -10,6 +10,12 @@ Rather than reading a long password out loud, run _Setup > Network > QR Code_ wh
 
 If you actually need the password itself, `omarchy network password <interface>` prints it.
 
+## Joining from a QR code
+
+Going the other way works too. When a phone shares its Wi-Fi as a QR code, click the camera icon at the top of the network panel, or press `Q` in the panel, and hold the phone up to the webcam. Once the code is read, the preview closes and the panel asks whether to connect, mentioning when it will replace a saved password. Close the preview to give up.
+
+The password goes straight to NetworkManager and is never shown or copied. It works with open, WPA, WPA3, and WEP networks, hidden ones included. Enterprise Wi-Fi, which needs a username and certificates, still has to be set up by hand.
+
 ## DNS
 
 Omarchy uses whatever DNS your network hands out over DHCP. You can override that for the whole machine under _Setup > Network > DNS_, where Cloudflare and Google are one click away. Pick _Custom_ to type in your own servers.

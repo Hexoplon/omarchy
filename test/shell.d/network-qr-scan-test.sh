@@ -370,3 +370,147 @@ check(not mocks["choose_camera"].called, "the camera stays off when there is not
 events, mocks = run_main("connect\n", connect=Mock(side_effect=qr.WifiError("Timed out connecting.")))
 check_equal(events[-1], {"event": "error", "message": "Timed out connecting."}, "a failed join ends with its error")
 PY
+
+run_node_test <<'JS'
+const network = requireFromRoot('shell/plugins/panels/network/Model.js')
+
+const idle = { state: 'idle', network: null, error: '' }
+const scanning = { state: 'scanning', network: null, error: '' }
+const ready = network.qrScanStep(scanning, { event: 'ready', ssid: 'Lab', security: 'WPA', hidden: false, saved: true })
+assertDeepEqual(ready, { state: 'ready', network: { ssid: 'Lab', security: 'WPA', hidden: false, saved: true }, error: '' }, 'a scanned code waits for confirmation')
+
+const connecting = network.qrScanStep(ready, { event: 'connecting' })
+assertEqual(connecting.network.ssid, 'Lab', 'connecting keeps the scanned network')
+assertDeepEqual(network.qrScanStep(connecting, { event: 'connected' }), idle, 'a finished join hands over to the panel\'s own connected state')
+assertDeepEqual(network.qrScanStep(scanning, { event: 'cancelled' }), idle, 'closing the preview returns to idle')
+assertEqual(network.qrScanStep(scanning, { event: 'error', message: 'No webcam found.' }).error, 'No webcam found.', 'helper errors reach the panel')
+
+const lostJoin = network.qrScanStep(connecting, { event: 'exit' })
+assert(lostJoin.state === 'error' && /before the connection finished/.test(lostJoin.error),
+  'a helper lost mid-join does not blame the webcam')
+
+for (const state of ['scanning', 'ready', 'connecting']) {
+  const crashed = network.qrScanStep({ state, network: null, error: '' }, { event: 'exit' })
+  assertEqual(crashed.state, 'error', `a helper exit while ${state} is reported`)
+}
+const failed = { state: 'error', network: null, error: 'No webcam found.' }
+assert(network.qrScanStep(failed, { event: 'exit' }) === failed, 'the exit after a reported error keeps that error')
+assert(network.qrScanStep(idle, { event: 'exit' }) === idle, 'the exit after a cancel stays idle')
+
+assertEqual(network.qrScanDetail({ ssid: 'Lab', security: 'WPA', hidden: false, saved: true }, 'Home'),
+  'WPA · Replaces the saved password · Disconnects Home', 'the prompt says what joining changes')
+assertEqual(network.qrScanDetail({ ssid: 'Cafe', security: 'NOPASS', hidden: true, saved: false }, 'Cafe'),
+  'Open network · Hidden · New network', 'the prompt describes an open hidden network')
+JS
+
+require_compositor "network QR scan runtime test"
+require_command quickshell
+
+# The real panel against a scripted helper: each scan run plays the next
+# scene, so the QML state machine, focus, and process handling run for real
+# with no camera or NetworkManager involved.
+stage="$tmp/stage"
+fixture="$SHELL_TEST_DIR/fixtures/network-qr-scan"
+mkdir -p "$stage/network" "$stage/bin" "$stage/home" "$stage/runs"
+ln -s "$ROOT/shell/Ui" "$stage/Ui"
+ln -s "$ROOT/shell/Commons" "$stage/Commons"
+cp -r "$SHELL_TEST_DIR/fixtures/network-panel/mocks" "$stage/mocks"
+cp "$fixture/shell.qml" "$stage/shell.qml"
+cp "$ROOT/shell/plugins/panels/network/Model.js" "$stage/network/Model.js"
+node - "$ROOT" "$stage" <<'JS'
+const fs = require('fs')
+const [root, stage] = process.argv.slice(2)
+let source = fs.readFileSync(`${root}/shell/plugins/panels/network/Panel.qml`, 'utf8')
+source = source.replace('import Quickshell.Networking', 'import Quickshell.Networking\nimport "../mocks"')
+source = source.replace(/\bNetworking\./g, 'NetworkMock.')
+source = source.replace('  id: root', `  id: root
+  property alias testKeys: keyCatcher
+  property alias testScan: scanAction
+  property alias testScanProc: qrScanProc
+  property alias testConnect: qrScanConnect
+  property alias testRetry: qrScanRetry
+  property alias testCancel: qrScanCancel
+  property alias testQrBlock: qrScanBlock`)
+fs.writeFileSync(`${stage}/network/Panel.qml`, source)
+JS
+
+printf '#!/bin/bash\nexit 0\n' >"$stage/bin/noop"
+chmod +x "$stage/bin/noop"
+for command in omarchy-dns omarchy-network-band omarchy-notification-send; do
+  ln -s noop "$stage/bin/$command"
+done
+# Synthetic details only, never the host's SSID or addresses.
+printf '#!/bin/bash\nprintf "type\\twifi\\niface\\ttest-wifi\\nssid\\tGuest Wi-Fi\\nip\\t192.0.2.10\\ngateway\\t192.0.2.1\\n"\n' >"$stage/bin/omarchy-network-status"
+chmod +x "$stage/bin/omarchy-network-status"
+
+cat >"$stage/bin/omarchy-network-qr-scan" <<'EOF'
+#!/bin/bash
+run=$(( $(ls "$QR_TEST_DIR/runs" | wc -l) + 1 ))
+printf '%s\n' "$*" >"$QR_TEST_DIR/runs/$run"
+printf '%s\n' "$$" >"$QR_TEST_DIR/pid-$run"
+ready='{"event":"ready","ssid":"Lab","security":"WPA","hidden":false,"saved":true}'
+case $run in
+  1)
+    echo '{"event":"ready","ssid":"Guest Wi-Fi","security":"WPA","hidden":false,"saved":true}'
+    read -r reply
+    printf '%s\n' "$reply" >"$QR_TEST_DIR/reply-1"
+    echo '{"event":"connecting","ssid":"Guest Wi-Fi","security":"WPA","hidden":false}'
+    echo '{"event":"connected","ssid":"Guest Wi-Fi","security":"WPA","hidden":false}'
+    ;;
+  2) echo '{"event":"error","message":"No webcam found. Check the camera connection or privacy switch, then try again."}' ;;
+  3)
+    echo "$ready"
+    read -r reply
+    printf '%s\n' "$reply" >"$QR_TEST_DIR/reply-3"
+    ;;
+  4) exit 3 ;;
+  5) echo '{"event":"cancelled"}' ;;
+  6)
+    echo '{"event":"ready","ssid":"Guest Wi-Fi","security":"WPA","hidden":false,"saved":true}'
+    read -r reply
+    echo '{"event":"connecting","ssid":"Guest Wi-Fi","security":"WPA","hidden":false}'
+    sleep 0.3
+    echo '{"event":"error","message":"The network rejected the password. Check that the QR code is current."}'
+    ;;
+  7)
+    echo "$ready"
+    read -r reply
+    printf '%s\n' "$reply" >"$QR_TEST_DIR/reply-7"
+    ;;
+esac
+EOF
+chmod +x "$stage/bin/omarchy-network-qr-scan"
+
+run_fixture() {
+  HOME="$stage/home" OMARCHY_PATH="$ROOT" PATH="$stage/bin:$PATH" QR_TEST_DIR="$stage" \
+    timeout 40 quickshell -p "$stage" --no-color 2>&1
+}
+
+output=$(run_fixture) || fail "network QR scan fixture exits cleanly" "$output"
+[[ $output == *"RESULT pass"* ]] || fail "network QR scan runtime assertions pass" "$output"
+if rg -q 'RESULT fail|ReferenceError|TypeError|Error:|Unable to assign|Binding loop' <<<"$output"; then
+  fail "network QR scan fixture has no QML errors" "$output"
+fi
+pass "the panel drives every scan outcome through to the right state"
+
+for run in 1 2 3 4 5 6 7; do
+  [[ $(<"$stage/runs/$run") == "--interface test-wifi" ]] || fail "every scan names the panel's Wi-Fi interface" "run $run: $(<"$stage/runs/$run")"
+done
+pass "every scan names the panel's Wi-Fi interface"
+
+[[ $(<"$stage/reply-1") == "connect" ]] || fail "Connect sends the helper its go-ahead"
+pass "Connect sends the helper its go-ahead"
+
+[[ ! -e $stage/reply-3 ]] || fail "Cancel never tells the helper to connect" "$(<"$stage/reply-3")"
+! kill -0 "$(<"$stage/pid-3")" 2>/dev/null || fail "Cancel stops the waiting helper"
+pass "Cancel stops the waiting helper without connecting"
+
+[[ ! -e $stage/reply-7 ]] || fail "closing the panel never tells the helper to connect" "$(<"$stage/reply-7")"
+! kill -0 "$(<"$stage/pid-7")" 2>/dev/null || fail "closing the panel stops the waiting helper"
+pass "closing the panel stops the waiting helper without connecting"
+
+if [[ -n ${QR_TEST_SCREENSHOT_DIR:-} ]]; then
+  for state in default ready error; do
+    QR_TEST_PREVIEW=$state QR_TEST_SCREENSHOT="$QR_TEST_SCREENSHOT_DIR/network-qr-$state.png" run_fixture >/dev/null
+  done
+fi

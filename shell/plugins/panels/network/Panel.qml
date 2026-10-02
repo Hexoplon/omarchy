@@ -28,6 +28,85 @@ Panel {
     identityText = ""
   }
 
+  // Webcam QR join. omarchy-network-qr-scan opens ZBar's camera preview,
+  // decodes the phone's Wi-Fi code, and joins only once confirmed here. The
+  // password stays in the helper; this side only ever sees the SSID.
+  property var qrScan: Model.qrScanIdle
+  readonly property string qrScanState: qrScan.state
+  readonly property bool qrScanPrompting: qrScanState === "ready" || qrScanState === "error"
+  // A listed network shows the join on its own row, like any other connect.
+  readonly property bool qrScanOnRow: qrScanState === "connecting" && actionKind === "connect"
+    && actionSsid === qrScan.network.ssid
+
+  function startQrScan() {
+    if (!canScanWifi || busy || qrScanProc.running) return
+    cancelPasswordPrompt()
+    qrScan = { state: "scanning", network: null, error: "" }
+    qrScanProc.command = ["omarchy-network-qr-scan"].concat(wifiDevice ? ["--interface", wifiDevice.name] : [])
+    // The preview is its own window, and the panel would cover it.
+    controller.hide()
+    qrScanProc.running = true
+    Quickshell.execDetached(["omarchy-notification-send", "-g", "󰄀", "Scan a Wi-Fi QR code",
+      "Hold your phone's Wi-Fi sharing code up to the camera. Close the preview to cancel."])
+  }
+
+  function cancelQrScan() {
+    qrScanProc.running = false
+    qrScan = Model.qrScanIdle
+    if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function confirmQrScan() {
+    if (qrScanState !== "ready" || !qrScanProc.running) return
+    var network = networkForSsid(qrScan.network.ssid)
+    if (network) runNetworkAction("connect", network, function() {})
+    qrScanProc.write("connect\n")
+    stepQrScan({ event: "connecting" })
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function stepQrScan(event) {
+    var previous = qrScanState
+    var network = qrScan.network
+    qrScan = Model.qrScanStep(qrScan, event)
+    if (qrScanState === previous) return
+
+    // The helper's outcome ends the row's join, unless NetworkManager's own
+    // connected state already did. A failure is explained inline, so drop the
+    // row's own failure status and password prompt, whichever landed first.
+    if (previous === "connecting") {
+      if (actionKind === "connect" && actionSsid === network.ssid) clearNetworkAction()
+      if (failureSsid === network.ssid) failureSsid = failureReason = ""
+      if (passwordSsid === network.ssid) cancelPasswordPrompt()
+    }
+
+    // Results land while the panel is hidden behind the preview.
+    if (qrScanPrompting) {
+      open()
+      Qt.callLater(function() { (qrScanState === "ready" ? qrScanConnect : qrScanRetry).forceActiveFocus() })
+    } else if (event.event === "connected") {
+      refresh(true)
+      if (!opened) Quickshell.execDetached(["omarchy-notification-send", "-g", "󰄀", "Wi-Fi connected", network.ssid])
+    } else if (qrScanState === "idle" && previous === "scanning") {
+      open()
+    }
+  }
+
+  // Destroying this Process, as a bar reload does, SIGKILLs the helper; the
+  // helper has the kernel take ZBar's preview and camera down with it.
+  Process {
+    id: qrScanProc
+    stdinEnabled: true
+    stdout: SplitParser {
+      onRead: function(line) {
+        var event
+        try { event = JSON.parse(line) } catch (error) { return }
+        root.stepQrScan(event)
+      }
+    }
+    onExited: root.stepQrScan({ event: "exit" })
+  }
+
   // Live connection details from `ip` / /sys / iw.
   property var info: ({})  // { iface, type, ip, prefix, gateway, speed, duplex, ssid, signal, freq, bitrate, rx_bytes, tx_bytes, router_ping_ms, internet_ping_ms }
 
@@ -111,7 +190,7 @@ Panel {
   // True while any wifi action is mid-flight. Rows
   // disable themselves on this so clicks on the other rows don't silently
   // no-op against runNetworkAction's serialized guard.
-  readonly property bool busy: actionKind !== ""
+  readonly property bool busy: actionKind !== "" || qrScanState === "connecting"
 
   // Index into `wifiNetworks` for keyboard navigation. -1 = no selection.
   property int selectedIndex: -1
@@ -130,11 +209,14 @@ Panel {
   // radio to switch. On a wired box it would otherwise sit there reading
   // "off" beside a perfectly live Ethernet connection.
   readonly property bool canToggleWifi: networkManagerAvailable && wifiStationAvailable
+  readonly property bool canScanWifi: canToggleWifi && Networking.wifiEnabled
   readonly property int qrHeaderIndex: canShareWifi ? 0 : -1
-  readonly property int speedHeaderIndex: canRunSpeedTest ? (canShareWifi ? 1 : 0) : -1
-  readonly property int toggleHeaderIndex: canToggleWifi ? (canShareWifi ? 1 : 0) + (canRunSpeedTest ? 1 : 0) : -1
-  readonly property int headerActionCount: (canShareWifi ? 1 : 0) + (canRunSpeedTest ? 1 : 0) + (canToggleWifi ? 1 : 0)
+  readonly property int scanHeaderIndex: canScanWifi ? (canShareWifi ? 1 : 0) : -1
+  readonly property int speedHeaderIndex: canRunSpeedTest ? (canShareWifi ? 1 : 0) + (canScanWifi ? 1 : 0) : -1
+  readonly property int toggleHeaderIndex: canToggleWifi ? (canShareWifi ? 1 : 0) + (canScanWifi ? 1 : 0) + (canRunSpeedTest ? 1 : 0) : -1
+  readonly property int headerActionCount: (canShareWifi ? 1 : 0) + (canScanWifi ? 1 : 0) + (canRunSpeedTest ? 1 : 0) + (canToggleWifi ? 1 : 0)
   readonly property bool qrHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === qrHeaderIndex
+  readonly property bool scanHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === scanHeaderIndex
   readonly property bool speedHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === speedHeaderIndex
   readonly property bool toggleHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === toggleHeaderIndex
   readonly property string toggleHint: Networking.wifiEnabled ? "Turn Wi-Fi off" : "Turn Wi-Fi on"
@@ -220,12 +302,14 @@ Panel {
     // network target; both cards are their own plugins now.
     function showQr() { root.summonWifiQr(true) }
     function speedTest() { root.summonSpeedTest() }
+    function scanQr() { root.startQrScan() }
     function openCaptivePortal() { root.openCaptivePortal() }
     function checkConnectivity() { root.checkConnectivity() }
   }
 
   function activateHeader() {
     if (headerIndex === qrHeaderIndex) summonWifiQr()
+    else if (headerIndex === scanHeaderIndex) startQrScan()
     else if (headerIndex === speedHeaderIndex) summonSpeedTest()
     else if (headerIndex === toggleHeaderIndex) toggleNetwork()
   }
@@ -330,6 +414,9 @@ Panel {
       syncBandIndex()
       cursorActive = hasCaptivePortal
     } else {
+      // Scanning and connecting carry on with the panel closed; a prompt does
+      // not, and closing on one stops its helper.
+      if (qrScanPrompting) cancelQrScan()
       // Drop a restart armed by this open: without it a close/reopen inside
       // the 100ms window reuses the running timer and re-enables the scanner
       // almost immediately, undoing the deferral #6605 restored.
@@ -1051,7 +1138,7 @@ Panel {
       anchors.fill: parent
       // Freeze the cursor model while the inline password prompt is open;
       // the TextField inside owns input until Esc/Enter/Cancel.
-      blocked: root.passwordSsid !== ""
+      blocked: root.passwordSsid !== "" || root.qrScanPrompting
 
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) {
@@ -1144,6 +1231,7 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refresh()
+        else if (t === "q" || t === "Q") root.startQrScan()
         else if (t === "w" || t === "W") root.toggleNetwork()
       }
 
@@ -1194,6 +1282,23 @@ Panel {
             Layout.alignment: Qt.AlignVCenter
             onHovered: function(on) { if (on) root.setHeaderCursor(root.qrHeaderIndex) }
             onClicked: root.summonWifiQr()
+          }
+
+          Button {
+            id: scanAction
+            visible: root.canScanWifi
+            enabled: !root.busy && !qrScanProc.running
+            iconText: "󰄀"
+            tooltipText: "Scan Wi-Fi QR with the webcam (Q)"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            iconSize: Style.font.subtitle * 1.5
+            horizontalPadding: Style.space(5)
+            verticalPadding: Style.space(2)
+            hasCursor: root.scanHeaderHasCursor
+            Layout.alignment: Qt.AlignVCenter
+            onHovered: function(on) { if (on) root.setHeaderCursor(root.scanHeaderIndex) }
+            onClicked: root.startQrScan()
           }
 
           Button {
@@ -1290,6 +1395,86 @@ Panel {
           }
         }
 
+      }
+
+      // Only takes room while a scanned code needs an answer, or while joining
+      // a network that has no row to show it.
+      Column {
+        id: qrScanBlock
+        visible: root.qrScanPrompting || (root.qrScanState === "connecting" && !root.qrScanOnRow)
+        width: parent.width
+        spacing: Style.spacing.controlGap
+        Keys.onEscapePressed: root.cancelQrScan()
+
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: {
+            var ssid = root.qrScan.network ? root.qrScan.network.ssid : ""
+            if (root.qrScanState === "error") return root.qrScan.error
+            if (root.qrScanState === "ready") return "Connect to " + ssid + "?"
+            return "Connecting to " + ssid + "…"
+          }
+          color: root.qrScanState === "error" ? root.bar.urgent : root.bar.foreground
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.body
+          wrapMode: Text.Wrap
+        }
+
+        Text {
+          visible: root.qrScanState === "ready"
+          width: parent.width
+          textFormat: Text.PlainText
+          text: root.qrScan.network ? Model.qrScanDetail(root.qrScan.network, root.connectedWifiNetwork ? root.connectedWifiNetwork.name : "") : ""
+          color: root.bar.foreground
+          opacity: 0.7
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.Wrap
+        }
+
+        RowLayout {
+          visible: root.qrScanPrompting
+          width: parent.width
+          spacing: Style.spacing.controlGap
+
+          Button {
+            id: qrScanConnect
+            visible: root.qrScanState === "ready"
+            text: "Connect"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            focusable: true
+            bordered: true
+            Layout.fillWidth: true
+            KeyNavigation.right: qrScanCancel
+            onClicked: root.confirmQrScan()
+          }
+
+          Button {
+            id: qrScanRetry
+            visible: root.qrScanState === "error"
+            text: "Try again"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            focusable: true
+            bordered: true
+            Layout.fillWidth: true
+            KeyNavigation.right: qrScanCancel
+            onClicked: root.startQrScan()
+          }
+
+          Button {
+            id: qrScanCancel
+            text: "Cancel"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            focusable: true
+            Layout.fillWidth: true
+            KeyNavigation.left: root.qrScanState === "ready" ? qrScanConnect : qrScanRetry
+            onClicked: root.cancelQrScan()
+          }
+        }
       }
 
       Column {

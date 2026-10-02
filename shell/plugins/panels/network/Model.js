@@ -363,6 +363,46 @@ function shouldRepromptPassphrase(reason, needsCredentials, reasons) {
   return reason === r.NoSecrets || reason === r.WifiAuthTimeout
 }
 
+// Webcam QR join, driven by the JSON events omarchy-network-qr-scan prints.
+// "exit" is the panel's own event for the helper process ending. Every path
+// the helper takes reports its outcome first, so exiting mid-flow is a crash.
+var qrScanStoppedMessage = "The Wi-Fi scanner stopped. Check the webcam and try again."
+var qrJoinStoppedMessage = "The Wi-Fi scanner stopped before the connection finished. Check the network list."
+var qrScanIdle = { state: "idle", network: null, error: "" }
+
+function qrScanStep(scan, event) {
+  var type = event && event.event
+  if (type === "ready") {
+    return {
+      state: "ready",
+      network: { ssid: event.ssid, security: event.security, hidden: !!event.hidden, saved: !!event.saved },
+      error: ""
+    }
+  }
+  if (type === "connecting") return { state: "connecting", network: scan.network, error: "" }
+  // Once joined, the panel's own connected state takes over.
+  if (type === "connected") return qrScanIdle
+  if (type === "error") return { state: "error", network: scan.network, error: event.message || qrScanStoppedMessage }
+  if (type === "cancelled") return qrScanIdle
+  if (type === "exit" && scan.state === "connecting")
+    return { state: "error", network: scan.network, error: qrJoinStoppedMessage }
+  if (type === "exit" && (scan.state === "scanning" || scan.state === "ready"))
+    return { state: "error", network: scan.network, error: qrScanStoppedMessage }
+  return scan
+}
+
+// One caption line under the confirmation prompt: what kind of network, and
+// what joining will change.
+function qrScanDetail(network, currentSsid) {
+  var open = network.security === "NOPASS"
+  var parts = [open ? "Open network" : ({ WEP: "WEP", WPA3: "WPA3", SAE: "WPA3" }[network.security] || "WPA")]
+  if (network.hidden) parts.push("Hidden")
+  if (network.saved) parts.push(open ? "Saved network" : "Replaces the saved password")
+  else parts.push("New network")
+  if (currentSsid && currentSsid !== network.ssid) parts.push("Disconnects " + currentSsid)
+  return parts.join(" · ")
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     parseNetworkStatus: parseNetworkStatus,
@@ -393,6 +433,9 @@ if (typeof module !== "undefined") {
     canForgetNetwork: canForgetNetwork,
     enterpriseConnectScript: enterpriseConnectScript,
     networkFailureReason: networkFailureReason,
-    shouldRepromptPassphrase: shouldRepromptPassphrase
+    shouldRepromptPassphrase: shouldRepromptPassphrase,
+    qrScanIdle: qrScanIdle,
+    qrScanStep: qrScanStep,
+    qrScanDetail: qrScanDetail
   }
 }
