@@ -1,0 +1,384 @@
+#!/usr/bin/python3
+
+# omarchy:summary=Join a Wi-Fi network from a QR code held up to the webcam
+# omarchy:group=network
+# omarchy:args=[--interface <interface>]
+# omarchy:hidden=true
+
+"""Scan a Wi-Fi QR code with the webcam and join the network it describes.
+
+The network panel drives this over newline-delimited JSON. Stdout reports
+`ready` (SSID, security, hidden, saved) once a Wi-Fi code is decoded, then
+`connecting` and `connected`, or `error` with a message, or `cancelled` when
+the camera preview is closed. Nothing joins until `connect` arrives on stdin.
+
+The password stays inside this process and goes to NetworkManager over D-Bus.
+It never reaches stdout, an argument list, the clipboard, or a file.
+
+Python rather than bash because nmcli takes the password as an argument or
+over a line-based prompt and cannot wait for the activation result. libnm does
+both from the one process that holds the secret.
+"""
+
+import argparse
+import ctypes
+import json
+import signal
+import string
+import subprocess
+import sys
+import uuid
+from dataclasses import dataclass
+
+import gi
+
+gi.require_version("NM", "1.0")
+from gi.repository import Gio, GLib, NM
+
+SCAN_TIMEOUT_SEC = 90
+CONNECT_TIMEOUT_SEC = 45
+PR_SET_PDEATHSIG = 1
+
+SECURITY_TYPES = ("WPA", "WPA2", "WPA3", "SAE", "WEP", "NOPASS")
+
+
+class WifiError(Exception):
+    pass
+
+
+@dataclass
+class WifiCode:
+    ssid: str
+    security: str
+    password: str
+    hidden: bool
+
+    def public(self):
+        return {"ssid": self.ssid, "security": self.security, "hidden": self.hidden}
+
+    @property
+    def passphrase(self):
+        return 8 <= len(self.password.encode("utf-8")) <= 63
+
+
+def parse_wifi(payload):
+    if not payload.startswith("WIFI:"):
+        raise WifiError("This is not a Wi-Fi QR code. Show your phone's Wi-Fi sharing code and try again.")
+
+    # Scan character by character: escaped semicolons, colons, and backslashes
+    # are ordinary password characters, and splitting on ";" would corrupt them.
+    fields = {}
+    token = ""
+    escaped = False
+    for char in payload[5:]:
+        if escaped:
+            token += char
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == ";":
+            if token:
+                key, separator, value = token.partition(":")
+                if not separator or key in fields:
+                    raise WifiError("The Wi-Fi QR code is malformed. Try generating it again.")
+                fields[key] = value
+            token = ""
+        else:
+            token += char
+    if escaped or token:
+        raise WifiError("The Wi-Fi QR code is malformed. Try generating it again.")
+
+    ssid = fields.get("S", "")
+    password = fields.get("P", "")
+    security = fields.get("T", "").upper() or "NOPASS"
+    hidden = fields.get("H", "").lower()
+
+    if security not in SECURITY_TYPES:
+        raise WifiError("This Wi-Fi security type is not supported. Join it from the network list instead.")
+    if not ssid or len(ssid.encode("utf-8")) > 32 or "\0" in ssid + password:
+        raise WifiError("The QR code has an invalid network name or password.")
+    if hidden not in ("true", "false", ""):
+        raise WifiError("The QR code has an invalid hidden-network setting.")
+
+    code = WifiCode(ssid, security, password, hidden == "true")
+    # WPA personal takes a passphrase or a raw 64-digit hex key.
+    raw_key = len(password) == 64 and all(c in string.hexdigits for c in password)
+    if security in ("WPA", "WPA2") and not (code.passphrase or raw_key):
+        raise WifiError("The QR code has an invalid Wi-Fi password. Try generating it again.")
+    if security in ("WPA3", "SAE", "WEP") and not password:
+        raise WifiError("The QR code is missing the Wi-Fi password.")
+    return code
+
+
+def emit(event, **values):
+    print(json.dumps({"event": event, **values}), flush=True)
+
+
+# The shell can die mid-scan, and nothing else would stop this process before
+# the scan timeout. Have the kernel signal it when the shell goes away.
+def die_with_parent():
+    ctypes.CDLL(None).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+
+
+def choose_camera():
+    listing = subprocess.run(["omarchy-capture-webcam-list"], capture_output=True, text=True, timeout=10)
+    cameras = [line.split()[0] for line in listing.stdout.splitlines() if line.startswith("/dev/video")]
+    if not cameras:
+        raise WifiError("No webcam found. Check the camera connection or privacy switch, then try again.")
+    return cameras[0]
+
+
+def scan(camera):
+    # --nodbus keeps ZBar from broadcasting the password on D-Bus. --raw
+    # --oneshot yields the payload's exact bytes, since spaces and newlines can
+    # belong to the password. -Sqrcode.binary skips charset guessing.
+    #
+    # Quickshell SIGKILLs a running Process when its plugin is destroyed, as a
+    # bar reload does, which leaves no chance to stop ZBar here. setpriv has the
+    # kernel stop it instead, so the preview and camera never outlive this
+    # process.
+    command = [
+        "setpriv", "--pdeathsig", "TERM", "--", "zbarcam", "--quiet", "--nodbus", "--raw", "--oneshot",
+        "-Sdisable", "-Sqrcode.enable", "-Sqrcode.binary", "--prescale=1280x720", camera,
+    ]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        payload, _ = process.communicate(timeout=SCAN_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise WifiError("No QR code detected. Enlarge the code on your phone, hold it steady, and try again.") from None
+
+    if not payload:
+        if process.returncode == 0:
+            return None
+        raise WifiError("Could not scan with the webcam. Close other camera apps and try again.")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise WifiError("The QR code uses an unsupported text encoding. Try sharing it again from your phone.") from None
+    return parse_wifi(text)
+
+
+def wifi_device(client, interface):
+    # NetworkManager events queue up while the preview or the confirmation
+    # holds this process, so catch up before trusting its state.
+    context = GLib.MainContext.default()
+    while context.iteration(False):
+        pass
+    if not client.get_nm_running():
+        raise WifiError("NetworkManager is not running.")
+    if not client.wireless_get_enabled():
+        raise WifiError("Wi-Fi is turned off. Turn it on and try again.")
+    devices = [
+        device for device in client.get_devices()
+        if device.get_device_type() == NM.DeviceType.WIFI and device.get_managed()
+        and (not interface or device.get_iface() == interface)
+    ]
+    if not devices:
+        raise WifiError("No Wi-Fi adapter is available.")
+    return devices[0]
+
+
+# The key management of saved profiles that can take this code's password.
+# NetworkManager's wpa-psk also joins WPA3 networks, and phones share WPA3 as
+# either T:SAE or a generic T:WPA, so personal profiles match across the two
+# whenever the password is a passphrase both accept.
+def compatible_key_mgmt(code):
+    if code.security in ("WPA", "WPA2"):
+        return ("wpa-psk", "sae") if code.passphrase else ("wpa-psk",)
+    if code.security in ("WPA3", "SAE"):
+        return ("sae", "wpa-psk") if code.passphrase else ("sae",)
+    return ("none",) if code.security == "WEP" else (None,)
+
+
+def saved_profile(client, device, code):
+    compatible = compatible_key_mgmt(code)
+
+    # Match the SSID bytes and security family rather than the profile name,
+    # and leave enterprise profiles alone: their secrets are not a password a
+    # QR code can replace.
+    matches = []
+    for connection in client.get_connections():
+        wireless = connection.get_setting_wireless()
+        if not wireless or connection.get_setting_802_1x():
+            continue
+        if wireless.get_mode() not in (None, "infrastructure"):
+            continue
+        ssid = wireless.get_ssid()
+        if not ssid or bytes(ssid.get_data()) != code.ssid.encode("utf-8"):
+            continue
+        security = connection.get_setting_wireless_security()
+        if (security.get_key_mgmt() if security else None) not in compatible:
+            continue
+        # Interface or MAC bindings can tie a profile to another adapter.
+        try:
+            device.connection_compatible(connection)
+        except GLib.Error:
+            continue
+        matches.append(connection)
+
+    # Prefer the profile NetworkManager last activated, as autoconnect would.
+    return max(matches, key=lambda connection: connection.get_setting_connection().get_timestamp(), default=None)
+
+
+def build_connection(code, existing=None):
+    # Update a clone so the saved profile's UUID, DNS, IP, band, and
+    # autoconnect choices survive; only the credential and SSID come from the code.
+    connection = NM.SimpleConnection.new_clone(existing) if existing else NM.SimpleConnection.new()
+    if not existing:
+        settings = NM.SettingConnection.new()
+        settings.props.id = code.ssid
+        settings.props.uuid = str(uuid.uuid4())
+        settings.props.type = NM.SETTING_WIRELESS_SETTING_NAME
+        connection.add_setting(settings)
+        wireless = NM.SettingWireless.new()
+        wireless.props.mode = NM.SETTING_WIRELESS_MODE_INFRA
+        connection.add_setting(wireless)
+
+    wireless = connection.get_setting_wireless()
+    wireless.props.ssid = GLib.Bytes.new(code.ssid.encode("utf-8"))
+    # Phones omit H for visible networks, so a code never un-hides a profile.
+    wireless.props.hidden = code.hidden or wireless.get_hidden()
+
+    old_security = connection.get_setting_wireless_security()
+    old_key_mgmt = old_security.get_key_mgmt() if old_security else None
+    if code.security == "NOPASS":
+        connection.remove_setting(NM.SettingWirelessSecurity)
+    else:
+        security = old_security or NM.SettingWirelessSecurity.new()
+        if code.security == "WEP":
+            security.props.key_mgmt = "none"
+            security.props.wep_key_type = NM.WepKeyType.KEY
+            security.props.wep_tx_keyidx = 0
+            security.props.wep_key_flags = NM.SettingSecretFlags.NONE
+            security.set_wep_key(0, code.password)
+        else:
+            # A saved profile keeps the key management it already joins with.
+            security.props.key_mgmt = old_key_mgmt or ("sae" if code.security in ("WPA3", "SAE") else "wpa-psk")
+            security.props.psk = code.password
+            security.props.psk_flags = NM.SettingSecretFlags.NONE
+        if not old_security:
+            connection.add_setting(security)
+
+    try:
+        connection.normalize()
+        connection.verify()
+        connection.verify_secrets()
+    except GLib.Error:
+        raise WifiError("The QR code's Wi-Fi settings are invalid. Try generating it again.") from None
+    return connection
+
+
+def connect(client, device, code):
+    existing = saved_profile(client, device, code)
+    profile = build_connection(code, existing)
+    loop = GLib.MainLoop()
+    cancellable = Gio.Cancellable()
+    # Set once, by whichever of success, failure, or the timeout comes first.
+    outcome = {}
+    active = None
+
+    def finish(error=None):
+        if "error" not in outcome:
+            outcome["error"] = error
+            loop.quit()
+
+    # The activation callback only means NetworkManager accepted the request;
+    # success is the active connection reaching ACTIVATED.
+    def state_changed(connection, state, reason):
+        if state == NM.ActiveConnectionState.ACTIVATED:
+            finish()
+        elif state == NM.ActiveConnectionState.DEACTIVATED:
+            if reason == NM.ActiveConnectionStateReason.NO_SECRETS:
+                finish("The network rejected the password. Check that the QR code is current.")
+            else:
+                finish("Could not connect. Check that the network is in range and try again.")
+
+    def watch_activation(source, result):
+        nonlocal active
+        try:
+            if existing:
+                active = source.activate_connection_finish(result)
+            else:
+                active = source.add_and_activate_connection_finish(result)
+        except GLib.Error:
+            finish("NetworkManager could not connect. Check Wi-Fi permissions and the QR code, then try again.")
+            return
+        active.connect("state-changed", state_changed)
+        state_changed(active, active.get_state(), NM.ActiveConnectionStateReason.UNKNOWN)
+
+    # Update2 replaces the whole profile, and TO_DISK keeps the new password
+    # across reboots. A failed join afterwards leaves it in place: the code is
+    # the network's current password, even when the network is out of range.
+    def activate_updated(source, result):
+        try:
+            source.update2_finish(result)
+        except GLib.Error:
+            finish("Could not update the saved Wi-Fi password. Check network permissions and try again.")
+            return
+        client.activate_connection_async(existing, device, None, cancellable, watch_activation)
+
+    def timed_out():
+        cancellable.cancel()
+        if active:
+            client.deactivate_connection_async(active, None, None)
+        finish("Timed out connecting. Check that the network is in range, then try again.")
+        return GLib.SOURCE_REMOVE
+
+    # No user_data arguments: PyGObject passes one on to the callback whenever
+    # it is given, even None, and these callbacks take (source, result).
+    if existing:
+        existing.update2(
+            profile.to_dbus(NM.ConnectionSerializationFlags.ALL), NM.SettingsUpdate2Flags.TO_DISK,
+            None, cancellable, activate_updated,
+        )
+    else:
+        client.add_and_activate_connection_async(profile, device, None, cancellable, watch_activation)
+    timer = GLib.timeout_add_seconds(CONNECT_TIMEOUT_SEC, timed_out)
+    loop.run()
+    if GLib.MainContext.default().find_source_by_id(timer):
+        GLib.source_remove(timer)
+
+    if outcome["error"]:
+        # A new profile that failed would linger with a wrong or unusable
+        # password, which is the state this flow exists to fix. Look it up by
+        # UUID: a timeout can land before NetworkManager reports the
+        # activation, after it has already saved the profile.
+        created = None if existing else client.get_connection_by_uuid(profile.get_uuid())
+        if created:
+            created.delete_async(None, lambda source, result: loop.quit())
+            loop.run()
+        raise WifiError(outcome["error"])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Join a Wi-Fi network from a QR code held up to the webcam.")
+    parser.add_argument("--interface", help="Wi-Fi interface to join with (default: first managed adapter)")
+    args = parser.parse_args()
+    die_with_parent()
+
+    try:
+        client = NM.Client.new(None)
+        # Fail before opening the camera when there is nothing to join with.
+        wifi_device(client, args.interface)
+        code = scan(choose_camera())
+        if code is None:
+            emit("cancelled")
+            return
+
+        saved = saved_profile(client, wifi_device(client, args.interface), code) is not None
+        emit("ready", saved=saved, **code.public())
+        if sys.stdin.readline().strip() != "connect":
+            return
+        emit("connecting", **code.public())
+        connect(client, wifi_device(client, args.interface), code)
+        emit("connected", **code.public())
+    except WifiError as error:
+        emit("error", message=str(error))
+    except (OSError, subprocess.SubprocessError, GLib.Error):
+        emit("error", message="The Wi-Fi scanner failed. Check the webcam and NetworkManager, then try again.")
+
+
+if __name__ == "__main__":
+    main()
